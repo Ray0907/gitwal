@@ -464,7 +464,7 @@ func (n *node) apply(ctx context.Context, repo, dir string, e Entry) error {
 
 // ---------- hook (pre-receive, run by git inside the bare repo) ----------
 
-func hook(ctx context.Context) error {
+func hook(ctx context.Context) (err error) {
 	store, err := newStore(ctx)
 	if err != nil {
 		return err
@@ -481,50 +481,71 @@ func hook(ctx context.Context) error {
 	}
 	packs, _ := filepath.Glob(filepath.Join(os.Getenv("GIT_QUARANTINE_PATH"), "pack", "*.pack"))
 
-	idx, etag, _, err := store.getIndex(ctx, repo, "")
-	if err != nil {
-		return err
-	}
-	// ponytail: scan backward instead of maintaining a second ref index; compact when WAL size matters.
-	for _, ref := range refs {
-		f := strings.Fields(ref)
-		if len(f) != 3 {
-			continue
+	var e Entry
+	lost := false
+	defer func() {
+		// ponytail: ambiguous writes may have committed; keep possible orphans and reconcile later.
+		if e.Pack && (lost || errors.Is(err, errConflict)) {
+			if cleanupErr := store.remove(ctx, packKey(repo, e.ID)); cleanupErr != nil {
+				log.Printf("hook %s cleanup %s: %v", repo, e.ID, cleanupErr)
+				err = fmt.Errorf("%w; cleanup %s: %v", err, e.ID, cleanupErr)
+			}
 		}
-		want := strings.Repeat("0", len(f[0]))
-		found := false
-	findRef:
-		for i := len(idx.Entries) - 1; i >= 0; i-- {
-			for _, prior := range idx.Entries[i].Refs {
-				p := strings.Fields(prior)
-				if len(p) == 3 && p[2] == f[2] {
-					want, found = p[1], true
-					break findRef
+	}()
+	// ponytail: same-repo pushes share one index; shard it if five CAS attempts are not enough.
+	for attempt := 0; attempt < 5; attempt++ {
+		idx, etag, _, readErr := store.getIndex(ctx, repo, "")
+		if readErr != nil {
+			return readErr
+		}
+		// ponytail: scan backward instead of maintaining a second ref index; compact when WAL size matters.
+		for _, ref := range refs {
+			f := strings.Fields(ref)
+			if len(f) != 3 {
+				continue
+			}
+			want := strings.Repeat("0", len(f[0]))
+			found := false
+		findRef:
+			for i := len(idx.Entries) - 1; i >= 0; i-- {
+				for _, prior := range idx.Entries[i].Refs {
+					p := strings.Fields(prior)
+					if len(p) == 3 && p[2] == f[2] {
+						want, found = p[1], true
+						break findRef
+					}
 				}
 			}
-		}
-		if !found {
-			if sha, ok := idx.Base.Refs[f[2]]; ok {
-				want = sha
+			if !found {
+				if sha, ok := idx.Base.Refs[f[2]]; ok {
+					want = sha
+				}
+			}
+			if f[0] != want {
+				return errConflict
 			}
 		}
-		if f[0] != want {
-			return errConflict
+		if e.ID == "" {
+			var rnd [4]byte
+			io.ReadFull(rand.Reader, rnd[:])
+			e = Entry{ID: fmt.Sprintf("%012d-%s", len(idx.Entries)+1, hex.EncodeToString(rnd[:])), Refs: refs}
+			for _, p := range packs {
+				if err := store.putPack(ctx, repo, e.ID, p); err != nil {
+					return err
+				}
+				e.Pack = true
+				break // ponytail: receive-pack produces one pack per push
+			}
+		}
+		idx.Entries = append(idx.Entries, e)
+		// Durable + linearized before git touches a single local ref.
+		_, err = store.putIndex(ctx, repo, idx, etag)
+		lost = errors.Is(err, errConflict)
+		if !lost {
+			break
 		}
 	}
-	var rnd [4]byte
-	io.ReadFull(rand.Reader, rnd[:])
-	e := Entry{ID: fmt.Sprintf("%012d-%s", len(idx.Entries)+1, hex.EncodeToString(rnd[:])), Refs: refs}
-	for _, p := range packs {
-		if err := store.putPack(ctx, repo, e.ID, p); err != nil {
-			return err
-		}
-		e.Pack = true
-		break // ponytail: receive-pack produces one pack per push
-	}
-	idx.Entries = append(idx.Entries, e)
-	// Durable + linearized before git touches a single local ref.
-	if _, err = store.putIndex(ctx, repo, idx, etag); err != nil {
+	if err != nil {
 		return err
 	}
 	self := os.Getenv("GITWAL_SELF")

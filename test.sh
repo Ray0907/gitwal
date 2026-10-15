@@ -17,11 +17,12 @@ export S3_KEY=minioadmin
 export S3_SECRET=minioadmin
 export GITWAL_BUCKET=gitwal
 
-A_PID= B_PID= MINIO_PID=
+A_PID= B_PID= MINIO_PID= GATE_PID=
 cleanup() {
     [ -z "$A_PID" ] || kill "$A_PID" 2>/dev/null || true
     [ -z "$B_PID" ] || kill "$B_PID" 2>/dev/null || true
     [ -z "$MINIO_PID" ] || kill "$MINIO_PID" 2>/dev/null || true
+    [ -z "$GATE_PID" ] || kill "$GATE_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -160,6 +161,48 @@ dd if=/dev/urandom of="$WORK/racer-b/b.bin" bs=1048576 count=16 2>/dev/null
 commit_file "$WORK/racer-a" a.bin racer-a
 commit_file "$WORK/racer-b" b.bin racer-b
 
+# Hold index writes until both packs are uploaded: force a real CAS race.
+cat >"$WORK/s3-gate.go" <<'EOF'
+package main
+
+import (
+    "log"
+    "net/http"
+    "net/http/httputil"
+    "net/url"
+    "os"
+    "strings"
+    "sync/atomic"
+    "time"
+)
+
+func main() {
+    target, err := url.Parse("http://" + os.Args[1])
+    if err != nil { log.Fatal(err) }
+    proxy := httputil.NewSingleHostReverseProxy(target)
+    ready := make(chan struct{})
+    var writes atomic.Int32
+    log.Fatal(http.ListenAndServe("127.0.0.1:9002", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.Method == "PUT" && strings.HasSuffix(r.URL.Path, "/index.json") {
+            if writes.Add(1) == 2 { close(ready) }
+            select {
+            case <-ready:
+            case <-time.After(10 * time.Second):
+                http.Error(w, "second push did not reach CAS", http.StatusGatewayTimeout)
+                return
+            }
+        }
+        proxy.ServeHTTP(w, r)
+    })))
+}
+EOF
+go build -o "$WORK/s3-gate" "$WORK/s3-gate.go"
+"$WORK/s3-gate" "$S3_ENDPOINT" >"$WORK/s3-gate.log" 2>&1 &
+GATE_PID=$!
+wait_url http://127.0.0.1:9002/ "$GATE_PID"
+cp "$P_DATA/demo.git/hooks/pre-receive" "$WORK/pre-receive"
+printf '#!/bin/sh\nexport S3_ENDPOINT=127.0.0.1:9002\nexec "%s" hook\n' "$ROOT/gitwal" >"$P_DATA/demo.git/hooks/pre-receive"
+
 set +e
 git -C "$WORK/racer-a" -c http.postBuffer=67108864 push origin main >"$WORK/push-a.log" 2>&1 &
 PUSH_A=$!
@@ -181,8 +224,59 @@ else
     exit 1
 fi
 grep -q 'concurrent push' "$LOSER_LOG"
+
+# A rejected push must not leave an unreferenced WAL pack in S3.
+curl -fsS "$P_HTTP/_/index/demo" >"$WORK/race-index.json"
+if command -v mc >/dev/null 2>&1; then
+    MC_HOST_gitwal="http://$S3_KEY:$S3_SECRET@$S3_ENDPOINT" \
+        mc ls --json "gitwal/$GITWAL_BUCKET/demo/wal/" >"$WORK/wal-list.json"
+    jq -r '.key' "$WORK/wal-list.json" >"$WORK/wal-keys"
+else
+    find "$MINIO_DATA/$GITWAL_BUCKET/demo/wal" -name '*.pack' -exec basename {} \; >"$WORK/wal-keys"
+fi
+test -s "$WORK/wal-keys"
+while IFS= read -r key; do
+    jq -e --arg id "${key%.pack}" \
+        '.base.id == $id or any(.entries[]; .pack and .id == $id)' \
+        "$WORK/race-index.json" >/dev/null || {
+        echo "orphan WAL pack: $key" >&2
+        exit 1
+    }
+done <"$WORK/wal-keys"
+
 git -C "$LOSER" pull -q --rebase origin main
 git -C "$LOSER" -c http.postBuffer=67108864 push -q origin main
+
+# Finish primary compaction before resetting the gate for the next race.
+curl -fsS "$P/info/refs?service=git-upload-pack" -o /dev/null
+curl -fsS "$P_HTTP/_/index/demo" | jq -e '.entries | length < 3' >/dev/null
+
+# Reset the gate so the different-branch test also forces a CAS conflict.
+kill "$GATE_PID"; wait "$GATE_PID" 2>/dev/null || true
+"$WORK/s3-gate" "$S3_ENDPOINT" >"$WORK/s3-gate.log" 2>&1 &
+GATE_PID=$!
+wait_url http://127.0.0.1:9002/ "$GATE_PID"
+
+# Different branches may race on the index, but neither push should be rejected.
+for who in a b; do
+    commit_file "$WORK/racer-$who" "branch-$who.txt" "branch-$who"
+done
+set +e
+git -C "$WORK/racer-a" -c http.postBuffer=67108864 push -q origin HEAD:refs/heads/branch-a >"$WORK/branch-a.log" 2>&1 &
+BRANCH_A=$!
+git -C "$WORK/racer-b" -c http.postBuffer=67108864 push -q origin HEAD:refs/heads/branch-b >"$WORK/branch-b.log" 2>&1 &
+BRANCH_B=$!
+wait "$BRANCH_A"; A_STATUS=$?
+wait "$BRANCH_B"; B_STATUS=$?
+set -e
+cp "$WORK/pre-receive" "$P_DATA/demo.git/hooks/pre-receive"
+if [ "$A_STATUS" -ne 0 ] || [ "$B_STATUS" -ne 0 ]; then
+    cat "$WORK/branch-a.log" "$WORK/branch-b.log" >&2
+    exit 1
+fi
+for who in a b; do
+    test "$(git ls-remote "$R" "refs/heads/branch-$who" | cut -f1)" = "$(git -C "$WORK/racer-$who" rev-parse HEAD)"
+done
 
 # Primary down: a replica must accept the push itself; the restarted primary catches up from S3.
 if [ "$R_NODE" = A ]; then

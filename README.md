@@ -4,6 +4,8 @@ A Git host where S3 is the only source of truth. ~700 lines of Go, two files, no
 
 Built to reproduce the storage design Cursor describes in [Git at any scale](https://cursor.com/blog/git-at-any-scale) (Continuity): every push is durably written to a write-ahead log in S3 before it is acknowledged, local bare repositories are disposable caches, and every replica is always consistent because reads verify against S3 first.
 
+The push path is also inspired by Anthropic's [Scion](https://www.anthropic.com/engineering/redesigning-source-control): commits should not be blocked by unrelated concurrent writes, and the only global state is a single compare-and-swap. A push that loses the index CAS retries against the fresh index and fails only if a ref it touches really moved. A rejected push deletes the pack it uploaded.
+
 ```text
                     S3
           index CAS + WAL/base packs
@@ -75,6 +77,8 @@ Requires Go, Git, `curl`, `jq`, and a `minio` binary (`brew install minio`). The
 
 - Batched S3 writes. Each push costs two PUTs.
 - Primary liveness is one TCP dial per push. No retry, no caching, no gossip of health.
+- Per-ref index. Pushes to one repository still share one index object; a push gives up after five lost CAS attempts.
+- Orphan pack reconciliation. After an ambiguous S3 write error the uploaded pack is kept, since the entry may have committed.
 - Authentication. Put it behind a reverse proxy.
 - Compaction deletes old packs after the index CAS. A fetch in flight on an old pack fails once and retries.
 
