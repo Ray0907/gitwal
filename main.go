@@ -419,6 +419,8 @@ func (n *node) initRepo(dir string) error {
 		{"init", "--bare", "-q", dir},
 		{"-C", dir, "config", "http.receivepack", "true"},
 		{"-C", dir, "config", "receive.unpackLimit", "1"}, // always keep pushes as packfiles
+		// A global core.hooksPath would silently skip our pre-receive and ack pushes without S3.
+		{"-C", dir, "config", "core.hooksPath", filepath.Join(dir, "hooks")},
 	}
 	for _, a := range steps {
 		if out, err := exec.Command("git", a...).CombinedOutput(); err != nil {
