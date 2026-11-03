@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -78,6 +79,10 @@ type node struct {
 	idle         time.Duration
 	gcInterval   time.Duration
 	locks        sync.Map
+	commits      sync.Map // repo -> *committer
+	syncs        sync.Map // repo -> *syncer
+	token        string   // shared with hooks so only they can append to the WAL
+	local        string   // loopback address hooks submit entries to
 }
 
 var (
@@ -112,7 +117,14 @@ func serve(ctx context.Context, listen, data, self, peerList string, compactAfte
 			peers = append(peers, peer)
 		}
 	}
+	var tok [16]byte
+	io.ReadFull(rand.Reader, tok[:])
+	local := listen
+	if host, port, err := net.SplitHostPort(listen); err == nil && (host == "" || host == "0.0.0.0" || host == "::") {
+		local = net.JoinHostPort("127.0.0.1", port)
+	}
 	n := &node{data: data, store: store, bin: bin, self: self, peers: peers,
+		token: hex.EncodeToString(tok[:]), local: local,
 		compactAfter: compactAfter, idle: idle, gcInterval: gcInterval,
 		git: filepath.Join(strings.TrimSpace(string(execPath)), "git-http-backend")}
 	udp, err := net.ListenPacket("udp", listen)
@@ -218,6 +230,10 @@ func (n *node) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(idx)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/_/commit/") {
+		n.handleCommit(w, r, strings.TrimPrefix(r.URL.Path, "/_/commit/"))
+		return
+	}
 	m := repoName.FindStringSubmatch(r.URL.Path)
 	if m == nil {
 		http.NotFound(w, r)
@@ -246,6 +262,8 @@ func (n *node) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"GIT_HTTP_EXPORT_ALL=1",
 			"GITWAL_BIN=" + n.bin,
 			"GITWAL_SELF=" + n.self,
+			"GITWAL_LOCAL=" + n.local,
+			"GITWAL_TOKEN=" + n.token,
 			"GITWAL_PEERS=" + strings.Join(n.peers, ","),
 		},
 		InheritEnv: []string{"PATH", "HOME", "S3_ENDPOINT", "S3_KEY", "S3_SECRET", "S3_SSL", "GITWAL_BUCKET"},
@@ -253,8 +271,54 @@ func (n *node) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.ServeHTTP(w, r)
 }
 
-// sync materializes the repo if missing and replays any WAL entries we have not applied.
+// syncer coalesces freshness checks: callers share one sync round per repo.
+type syncer struct {
+	mu      sync.Mutex
+	waiting []chan error
+	running bool
+}
+
+// sync returns once the local repo reflects the index as it was no earlier than this call.
+// A caller joins the next round, which starts after it arrived, never a round already in
+// flight: that round's index read may predate a push the caller already saw acknowledged.
 func (n *node) sync(ctx context.Context, repo string) error {
+	v, _ := n.syncs.LoadOrStore(repo, &syncer{})
+	s := v.(*syncer)
+	ch := make(chan error, 1)
+	s.mu.Lock()
+	s.waiting = append(s.waiting, ch)
+	start := !s.running
+	s.running = true
+	s.mu.Unlock()
+	if start {
+		go func() {
+			for {
+				s.mu.Lock()
+				round := s.waiting
+				s.waiting = nil
+				if len(round) == 0 {
+					s.running = false
+					s.mu.Unlock()
+					return
+				}
+				s.mu.Unlock()
+				err := n.syncOnce(context.Background(), repo)
+				for _, c := range round {
+					c <- err
+				}
+			}
+		}()
+	}
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// syncOnce materializes the repo if missing and replays any WAL entries we have not applied.
+func (n *node) syncOnce(ctx context.Context, repo string) error {
 	mu, _ := n.locks.LoadOrStore(repo, &sync.Mutex{})
 	mu.(*sync.Mutex).Lock()
 	defer mu.(*sync.Mutex).Unlock()
@@ -483,71 +547,28 @@ func hook(ctx context.Context) (err error) {
 	}
 	packs, _ := filepath.Glob(filepath.Join(os.Getenv("GIT_QUARANTINE_PATH"), "pack", "*.pack"))
 
-	var e Entry
-	lost := false
+	var rnd [4]byte
+	io.ReadFull(rand.Reader, rnd[:])
+	e := Entry{ID: fmt.Sprintf("%d-%s", time.Now().UnixNano(), hex.EncodeToString(rnd[:])), Refs: refs}
 	defer func() {
-		// ponytail: ambiguous writes may have committed; keep possible orphans and reconcile later.
-		if e.Pack && (lost || errors.Is(err, errConflict)) {
+		// ponytail: ambiguous failures may have committed; keep possible orphans and reconcile later.
+		if e.Pack && (errors.Is(err, errConflict) || errors.Is(err, errLost)) {
 			if cleanupErr := store.remove(ctx, packKey(repo, e.ID)); cleanupErr != nil {
 				log.Printf("hook %s cleanup %s: %v", repo, e.ID, cleanupErr)
 				err = fmt.Errorf("%w; cleanup %s: %v", err, e.ID, cleanupErr)
 			}
 		}
 	}()
-	// ponytail: same-repo pushes share one index; shard it if five CAS attempts are not enough.
-	for attempt := 0; attempt < 5; attempt++ {
-		idx, etag, _, readErr := store.getIndex(ctx, repo, "")
-		if readErr != nil {
-			return readErr
+	// ponytail: a stale push uploads its pack before the node rejects it; pre-check if that waste matters.
+	for _, p := range packs {
+		if err := store.putPack(ctx, repo, e.ID, p); err != nil {
+			return err
 		}
-		// ponytail: scan backward instead of maintaining a second ref index; compact when WAL size matters.
-		for _, ref := range refs {
-			f := strings.Fields(ref)
-			if len(f) != 3 {
-				continue
-			}
-			want := strings.Repeat("0", len(f[0]))
-			found := false
-		findRef:
-			for i := len(idx.Entries) - 1; i >= 0; i-- {
-				for _, prior := range idx.Entries[i].Refs {
-					p := strings.Fields(prior)
-					if len(p) == 3 && p[2] == f[2] {
-						want, found = p[1], true
-						break findRef
-					}
-				}
-			}
-			if !found {
-				if sha, ok := idx.Base.Refs[f[2]]; ok {
-					want = sha
-				}
-			}
-			if f[0] != want {
-				return errConflict
-			}
-		}
-		if e.ID == "" {
-			var rnd [4]byte
-			io.ReadFull(rand.Reader, rnd[:])
-			e = Entry{ID: fmt.Sprintf("%012d-%s", len(idx.Entries)+1, hex.EncodeToString(rnd[:])), Refs: refs}
-			for _, p := range packs {
-				if err := store.putPack(ctx, repo, e.ID, p); err != nil {
-					return err
-				}
-				e.Pack = true
-				break // ponytail: receive-pack produces one pack per push
-			}
-		}
-		idx.Entries = append(idx.Entries, e)
-		// Durable + linearized before git touches a single local ref.
-		_, err = store.putIndex(ctx, repo, idx, etag)
-		lost = errors.Is(err, errConflict)
-		if !lost {
-			break
-		}
+		e.Pack = true
+		break // ponytail: receive-pack produces one pack per push
 	}
-	if err != nil {
+	// Durable + linearized before git touches a single local ref.
+	if err = submit(ctx, repo, e); err != nil {
 		return err
 	}
 	self := os.Getenv("GITWAL_SELF")
@@ -562,6 +583,32 @@ func hook(ctx context.Context) (err error) {
 		}
 	}
 	return nil
+}
+
+// submit hands the entry to the local node, which batches it into the index CAS.
+func submit(ctx context.Context, repo string, e Entry) error {
+	body, _ := json.Marshal(e)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://"+os.Getenv("GITWAL_LOCAL")+"/_/commit/"+repo, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Gitwal-Token", os.Getenv("GITWAL_TOKEN"))
+	resp, err := (&http.Client{Timeout: 2 * time.Minute}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return nil
+	case http.StatusConflict:
+		return errConflict
+	case http.StatusServiceUnavailable:
+		return errLost
+	}
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return fmt.Errorf("commit: %s %s", resp.Status, bytes.TrimSpace(msg))
 }
 
 func reachable(addr string) bool {

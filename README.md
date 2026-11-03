@@ -1,6 +1,6 @@
 # gitwal
 
-A Git host where S3 is the only source of truth. ~700 lines of Go, two files, no database, no consensus.
+A Git host where S3 is the only source of truth. ~900 lines of Go, three files, no database, no consensus.
 
 Built to reproduce the storage design Cursor describes in [Git at any scale](https://cursor.com/blog/git-at-any-scale) (Continuity): every push is durably written to a write-ahead log in S3 before it is acknowledged, local bare repositories are disposable caches, and every replica is always consistent because reads verify against S3 first.
 
@@ -27,7 +27,7 @@ The push path is also inspired by Anthropic's [Scion](https://www.anthropic.com/
 
 ## How it works
 
-**Push.** The client talks to plain `git http-backend`. A `pre-receive` hook uploads the quarantined packfile to `<repo>/wal/<id>.pack`, then appends `{id, refs}` to `<repo>/index.json` with `If-Match` on the ETag it read. A 412 rejects the push; the client retries. Git updates local refs only after the CAS succeeds.
+**Push.** The client talks to plain `git http-backend`. A `pre-receive` hook uploads the quarantined packfile to `<repo>/wal/<id>.pack`, then hands `{id, refs}` to its own node over a token-protected local endpoint. The node group-commits: entries that arrive while an index write is in flight share the next one, validated in order, published with one `If-Match` CAS on `<repo>/index.json`. An entry whose ref really moved is rejected and its pack deleted. Git updates local refs only after the CAS succeeds.
 
 **Read.** Before serving any request, the node does a conditional GET on the index. A 304 means it is current. A 200 means it replays the missing entries with `git index-pack` and `git update-ref`, then serves.
 
@@ -75,7 +75,8 @@ Requires Go, Git, `curl`, `jq`, and a `minio` binary (`brew install minio`). The
 
 ## Not implemented
 
-- Batched S3 writes. Each push costs two PUTs.
+- Cross-node batching. Group commit is per node; nodes still race on the index CAS.
+- Cheaper read freshness. Concurrent requests share one index GET per round, but a request that arrives mid-round waits for the next one, so a quiet repo still pays one S3 round trip per request.
 - Primary liveness is one TCP dial per push. No retry, no caching, no gossip of health.
 - Per-ref index. Pushes to one repository still share one index object; a push gives up after five lost CAS attempts.
 - Orphan pack reconciliation. After an ambiguous S3 write error the uploaded pack is kept, since the entry may have committed.

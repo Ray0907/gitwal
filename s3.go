@@ -38,7 +38,10 @@ type Index struct {
 	Entries []Entry `json:"entries"`
 }
 
-var errConflict = errors.New("gitwal: concurrent push, retry")
+var (
+	errConflict = errors.New("gitwal: concurrent push, retry")
+	errLost     = errors.New("gitwal: lost index CAS repeatedly, retry")
+)
 
 func newStore(ctx context.Context) (*Store, error) {
 	env := func(k, d string) string {

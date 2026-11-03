@@ -4,6 +4,10 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 WORK=/tmp/gitwal-e2e
 MINIO_DATA=$WORK/minio
+GATE_FLAG=$WORK/gate-on
+GATE_COUNT=$WORK/gate-puts
+GATE_GET_FLAG=$WORK/gate-get-on
+GATE_GET_COUNT=$WORK/gate-gets
 A_DATA=/tmp/gitwal-A
 B_DATA=/tmp/gitwal-B
 A_HOST=127.0.0.1:8081
@@ -12,7 +16,7 @@ PEERS=$A_HOST,$B_HOST
 A_HTTP=http://$A_HOST
 B_HTTP=http://$B_HOST
 
-export S3_ENDPOINT=127.0.0.1:9000
+export S3_ENDPOINT=127.0.0.1:9002
 export S3_KEY=minioadmin
 export S3_SECRET=minioadmin
 export GITWAL_BUCKET=gitwal
@@ -90,6 +94,53 @@ wait_url http://127.0.0.1:9000/minio/health/live "$MINIO_PID" || {
 
 cd "$ROOT"
 go build -o gitwal .
+# S3 gate: while $GATE_FLAG exists, every index.json PUT is counted and delayed,
+# which widens the race window like a real S3 round trip would.
+cat >"$WORK/s3-gate.go" <<'EOF'
+package main
+
+import (
+    "log"
+    "net/http"
+    "net/http/httputil"
+    "net/url"
+    "os"
+    "strings"
+    "time"
+)
+
+func main() {
+    target, err := url.Parse("http://" + os.Args[1])
+    if err != nil { log.Fatal(err) }
+    delay, _ := time.ParseDuration(os.Args[2])
+    proxy := httputil.NewSingleHostReverseProxy(target)
+    log.Fatal(http.ListenAndServe("127.0.0.1:9002", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.Method == "PUT" && strings.HasSuffix(r.URL.Path, "/index.json") {
+            if _, err := os.Stat(os.Args[3]); err == nil {
+                if f, err := os.OpenFile(os.Args[4], os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+                    f.WriteString("put\n")
+                    f.Close()
+                }
+                time.Sleep(delay)
+            }
+        }
+        if r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/index.json") {
+            if _, err := os.Stat(os.Args[5]); err == nil {
+                if f, err := os.OpenFile(os.Args[6], os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+                    f.WriteString("get\n")
+                    f.Close()
+                }
+                time.Sleep(delay)
+            }
+        }
+        proxy.ServeHTTP(w, r)
+    })))
+}
+EOF
+go build -o "$WORK/s3-gate" "$WORK/s3-gate.go"
+"$WORK/s3-gate" 127.0.0.1:9000 700ms "$GATE_FLAG" "$GATE_COUNT" "$GATE_GET_FLAG" "$GATE_GET_COUNT" >"$WORK/s3-gate.log" 2>&1 &
+GATE_PID=$!
+wait_url http://127.0.0.1:9002/ "$GATE_PID"
 start_a
 start_b
 
@@ -161,47 +212,8 @@ dd if=/dev/urandom of="$WORK/racer-b/b.bin" bs=1048576 count=16 2>/dev/null
 commit_file "$WORK/racer-a" a.bin racer-a
 commit_file "$WORK/racer-b" b.bin racer-b
 
-# Hold index writes until both packs are uploaded: force a real CAS race.
-cat >"$WORK/s3-gate.go" <<'EOF'
-package main
-
-import (
-    "log"
-    "net/http"
-    "net/http/httputil"
-    "net/url"
-    "os"
-    "strings"
-    "sync/atomic"
-    "time"
-)
-
-func main() {
-    target, err := url.Parse("http://" + os.Args[1])
-    if err != nil { log.Fatal(err) }
-    proxy := httputil.NewSingleHostReverseProxy(target)
-    ready := make(chan struct{})
-    var writes atomic.Int32
-    log.Fatal(http.ListenAndServe("127.0.0.1:9002", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        if r.Method == "PUT" && strings.HasSuffix(r.URL.Path, "/index.json") {
-            if writes.Add(1) == 2 { close(ready) }
-            select {
-            case <-ready:
-            case <-time.After(10 * time.Second):
-                http.Error(w, "second push did not reach CAS", http.StatusGatewayTimeout)
-                return
-            }
-        }
-        proxy.ServeHTTP(w, r)
-    })))
-}
-EOF
-go build -o "$WORK/s3-gate" "$WORK/s3-gate.go"
-"$WORK/s3-gate" "$S3_ENDPOINT" >"$WORK/s3-gate.log" 2>&1 &
-GATE_PID=$!
-wait_url http://127.0.0.1:9002/ "$GATE_PID"
-cp "$P_DATA/demo.git/hooks/pre-receive" "$WORK/pre-receive"
-printf '#!/bin/sh\nexport S3_ENDPOINT=127.0.0.1:9002\nexec "%s" hook\n' "$ROOT/gitwal" >"$P_DATA/demo.git/hooks/pre-receive"
+# Delay index writes so the two pushes really overlap.
+touch "$GATE_FLAG"
 
 set +e
 git -C "$WORK/racer-a" -c http.postBuffer=67108864 push origin main >"$WORK/push-a.log" 2>&1 &
@@ -251,12 +263,6 @@ git -C "$LOSER" -c http.postBuffer=67108864 push -q origin main
 curl -fsS "$P/info/refs?service=git-upload-pack" -o /dev/null
 curl -fsS "$P_HTTP/_/index/demo" | jq -e '.entries | length < 3' >/dev/null
 
-# Reset the gate so the different-branch test also forces a CAS conflict.
-kill "$GATE_PID"; wait "$GATE_PID" 2>/dev/null || true
-"$WORK/s3-gate" "$S3_ENDPOINT" >"$WORK/s3-gate.log" 2>&1 &
-GATE_PID=$!
-wait_url http://127.0.0.1:9002/ "$GATE_PID"
-
 # Different branches may race on the index, but neither push should be rejected.
 for who in a b; do
     commit_file "$WORK/racer-$who" "branch-$who.txt" "branch-$who"
@@ -269,7 +275,6 @@ BRANCH_B=$!
 wait "$BRANCH_A"; A_STATUS=$?
 wait "$BRANCH_B"; B_STATUS=$?
 set -e
-cp "$WORK/pre-receive" "$P_DATA/demo.git/hooks/pre-receive"
 if [ "$A_STATUS" -ne 0 ] || [ "$B_STATUS" -ne 0 ]; then
     cat "$WORK/branch-a.log" "$WORK/branch-b.log" >&2
     exit 1
@@ -277,6 +282,67 @@ fi
 for who in a b; do
     test "$(git ls-remote "$R" "refs/heads/branch-$who" | cut -f1)" = "$(git -C "$WORK/racer-$who" rev-parse HEAD)"
 done
+
+# Burst: concurrent pushes to distinct branches must share index writes
+# (group commit) instead of paying one CAS round trip each.
+: >"$GATE_COUNT"
+BURST=8
+for i in $(seq "$BURST"); do
+    git clone -q "$P" "$WORK/burst-$i"
+    commit_file "$WORK/burst-$i" "burst-$i.txt" "burst-$i"
+done
+set +e
+for i in $(seq "$BURST"); do
+    git -C "$WORK/burst-$i" push -q origin HEAD:refs/heads/burst-$i >"$WORK/burst-$i.log" 2>&1 &
+    eval "BURST_PID_$i=$!"
+done
+BURST_FAIL=0
+for i in $(seq "$BURST"); do
+    eval "wait \$BURST_PID_$i" || BURST_FAIL=$((BURST_FAIL + 1))
+done
+set -e
+test "$BURST_FAIL" -eq 0
+for i in $(seq "$BURST"); do
+    test "$(git ls-remote "$R" "refs/heads/burst-$i" | cut -f1)" = "$(git -C "$WORK/burst-$i" rev-parse HEAD)"
+done
+PUTS=$(wc -l <"$GATE_COUNT" | tr -d ' ')
+echo "burst: $BURST pushes, $PUTS index writes"
+test "$PUTS" -lt "$BURST"
+rm -f "$GATE_FLAG"
+
+# Read burst: concurrent requests must share index freshness checks, and a
+# read right after an acked push must still see that push.
+: >"$GATE_GET_COUNT"
+touch "$GATE_GET_FLAG"
+READS=12
+set +e
+for i in $(seq "$READS"); do
+    git ls-remote "$P" >"$WORK/read-$i.out" 2>&1 &
+    eval "READ_PID_$i=$!"
+done
+READ_FAIL=0
+for i in $(seq "$READS"); do
+    eval "wait \$READ_PID_$i" || READ_FAIL=$((READ_FAIL + 1))
+done
+set -e
+test "$READ_FAIL" -eq 0
+GETS=$(wc -l <"$GATE_GET_COUNT" | tr -d ' ')
+echo "read burst: $READS reads, $GETS index reads"
+test "$GETS" -lt "$READS"
+commit_file "$WORK/burst-1" fresh.txt fresh
+git -C "$WORK/burst-1" push -q origin HEAD:refs/heads/fresh
+FRESH=$(git -C "$WORK/burst-1" rev-parse HEAD)
+for i in 1 2 3 4; do
+    git ls-remote "$P" refs/heads/fresh >"$WORK/fresh-$i.out" &
+    eval "FRESH_PID_$i=$!"
+done
+for i in 1 2 3 4; do
+    eval "wait \$FRESH_PID_$i"
+done
+for i in 1 2 3 4; do
+    test "$(cut -f1 <"$WORK/fresh-$i.out")" = "$FRESH"
+done
+rm -f "$GATE_GET_FLAG"
 
 # Primary down: a replica must accept the push itself; the restarted primary catches up from S3.
 if [ "$R_NODE" = A ]; then
